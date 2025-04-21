@@ -835,6 +835,9 @@ func (s *Server) Start() error {
 	if err := s.Channels().Start(); err != nil {
 		return errors.Wrap(err, "Unable to start channels")
 	}
+	if *s.platform.Config().ClusterSettings.Enable && s.platform.Cluster() != nil {
+		s.joinCluster = true
+	}
 
 	if s.joinCluster && s.platform.Cluster() != nil {
 		s.registerClusterHandlers()
@@ -1295,10 +1298,6 @@ func doConfigCleanup(s *Server) {
 	if err := s.platform.CleanUpConfig(); err != nil {
 		mlog.Warn("Error while cleaning up configurations", mlog.Err(err))
 	}
-}
-
-func (s *Server) HandleMetrics(route string, h http.Handler) {
-	s.platform.HandleMetrics(route, h)
 }
 
 func (s *Server) sendLicenseUpForRenewalEmail(users map[string]*model.User, license *model.License) *model.AppError {

@@ -1,0 +1,1153 @@
+package platform
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+
+	"github.com/mattermost/mattermost/server/public/model"
+	"github.com/mattermost/mattermost/server/public/shared/mlog"
+	"github.com/mattermost/mattermost/server/public/shared/request"
+	"github.com/mattermost/mattermost/server/v8/einterfaces"
+)
+
+// Redis constants
+const (
+	// Redis keys and channels
+	redisPubSubChannel    = "mattermost_cluster"
+	redisLeaderKey        = "mattermost_cluster_leader"
+	redisNodesKey         = "mattermost_cluster_nodes"
+	redisEventChannel     = "mattermost_cluster_events"
+	redisReliablePrefix   = "mattermost_cluster_reliable"
+	
+	// Timing constants
+	leaderTTL             = 15 * time.Second
+	nodesTTL              = 20 * time.Second
+	heartbeatInterval     = 5 * time.Second
+	syncTimeout           = 10 * time.Second
+	reliableMessageTTL    = 24 * time.Hour
+	reliableProcessDelay  = 500 * time.Millisecond
+	reliableRetryInterval = 5 * time.Second
+	
+	// Buffer sizes
+	maxMessageBuffer      = 1000
+)
+
+// RedisCluster implements ClusterInterface using Redis
+type RedisCluster struct {
+	// Core components
+	ps              *PlatformService
+	nodeID          string
+	rdb             *redis.Client
+	pubsub          *redis.PubSub
+	logger          *mlog.Logger
+	
+	// State management
+	isReady         atomic.Bool
+	isLeader        atomic.Bool
+	lastSync        atomic.Int64
+	syncVersion     atomic.Int64
+	reliableEnabled bool
+	
+	// Message handling
+	handlers        map[model.ClusterEvent][]einterfaces.ClusterMessageHandler
+	handlersMutex   sync.RWMutex
+	messageBuffer   chan model.ClusterMessage
+	processedMsgs   sync.Map
+	retryQueue      chan *model.ClusterMessage
+	retryMutex      sync.Mutex
+	broadcastHooks  map[string]BroadcastHook
+	
+	// Context and lifecycle management
+	ctx             context.Context
+	cancel          context.CancelFunc
+	stopChan        chan struct{}
+	wg              sync.WaitGroup
+}
+
+// ======================================================
+// Constructor and Lifecycle Management
+// ======================================================
+
+// NewRedisCluster creates a new Redis-based cluster implementation
+func NewRedisCluster(ps *PlatformService, hooks map[string]BroadcastHook) *RedisCluster {
+	nodeID := model.NewId()
+	ctx, cancel := context.WithCancel(context.Background())
+
+	rc := &RedisCluster{
+		// Core components
+		ps:              ps,
+		nodeID:          nodeID,
+		logger:          ps.logger.With(mlog.String("cluster_node_id", nodeID)),
+		
+		// State management
+		reliableEnabled: true,
+		
+		// Message handling
+		handlers:        make(map[model.ClusterEvent][]einterfaces.ClusterMessageHandler),
+		messageBuffer:   make(chan model.ClusterMessage, maxMessageBuffer),
+		retryQueue:      make(chan *model.ClusterMessage, 1000),
+		broadcastHooks:  hooks,
+		
+		// Context and lifecycle management
+		ctx:             ctx,
+		cancel:          cancel,
+		stopChan:        make(chan struct{}),
+	}
+
+	// Initialize Redis client
+	cfg := ps.Config().CacheSettings
+	rc.rdb = redis.NewClient(&redis.Options{
+		Addr:     *cfg.RedisAddress,
+		Password: *cfg.RedisPassword,
+		DB:       int(*cfg.RedisDB),
+	})
+
+	// Register default platform handlers
+	rc.registerDefaultHandlers()
+
+	return rc
+}
+
+// registerDefaultHandlers registers the platform's cluster handlers
+func (rc *RedisCluster) registerDefaultHandlers() {
+	rc.RegisterClusterMessageHandler(model.ClusterEventPublish, rc.ps.ClusterPublishHandler)
+	rc.RegisterClusterMessageHandler(model.ClusterEventUpdateStatus, rc.ps.ClusterUpdateStatusHandler)
+	rc.RegisterClusterMessageHandler(model.ClusterEventInvalidateAllCaches, rc.ps.ClusterInvalidateAllCachesHandler)
+	rc.RegisterClusterMessageHandler(model.ClusterEventInvalidateWebConnCacheForUser, rc.ps.clusterInvalidateWebConnSessionCacheForUserHandler)
+	rc.RegisterClusterMessageHandler(model.ClusterEventBusyStateChanged, rc.ps.clusterBusyStateChgHandler)
+}
+
+// Start initializes and starts the Redis cluster
+func (rc *RedisCluster) Start() error {
+	// Test Redis connection with timeout
+	ctx, cancel := context.WithTimeout(rc.ctx, 5*time.Second)
+	defer cancel()
+
+	if err := rc.rdb.Ping(ctx).Err(); err != nil {
+		return fmt.Errorf("failed to connect to Redis: %w", err)
+	}
+
+	// Subscribe to cluster events
+	rc.pubsub = rc.rdb.Subscribe(rc.ctx, redisPubSubChannel, redisEventChannel)
+
+	// Start cluster routines
+	rc.wg.Add(7)
+	go rc.leaderElectionLoop()
+	go rc.heartbeatLoop()
+	go rc.messageListener()
+	go rc.messageProcessor()
+	go rc.syncLoop()
+	go rc.processReliableMessages()
+	go rc.processRetryQueue()
+
+	// Mark the node as ready
+	rc.isReady.Store(true)
+
+	rc.logger.Info("Redis cluster started",
+		mlog.String("node_id", rc.nodeID),
+		mlog.String("redis_address", *rc.ps.Config().CacheSettings.RedisAddress),
+		mlog.Bool("reliable_enabled", rc.reliableEnabled))
+
+	return nil
+}
+
+// Stop terminates all cluster activities
+func (rc *RedisCluster) Stop() {
+	rc.logger.Info("Stopping Redis cluster", mlog.String("node_id", rc.nodeID))
+	rc.cancel()
+	close(rc.stopChan)
+	if rc.pubsub != nil {
+		rc.pubsub.Close()
+	}
+	rc.wg.Wait()
+	rc.logger.Info("Redis cluster stopped", mlog.String("node_id", rc.nodeID))
+}
+
+// ======================================================
+// Leader Election and Heartbeat
+// ======================================================
+
+// leaderElectionLoop periodically attempts to become the cluster leader
+func (rc *RedisCluster) leaderElectionLoop() {
+	defer rc.wg.Done()
+	ticker := time.NewTicker(leaderTTL / 2)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-rc.ctx.Done():
+			return
+		case <-ticker.C:
+			rc.tryBecomeLeader()
+		}
+	}
+}
+
+// tryBecomeLeader attempts to acquire the leadership lock in Redis
+func (rc *RedisCluster) tryBecomeLeader() {
+	ctx, cancel := context.WithTimeout(rc.ctx, 2*time.Second)
+	defer cancel()
+
+	wasLeader := rc.IsLeader()
+
+	// Try to become leader using SET NX (only set if not exists)
+	success, err := rc.rdb.SetNX(ctx, redisLeaderKey, rc.nodeID, leaderTTL).Result()
+
+	if err != nil {
+		rc.logger.Error("Failed to perform leader election",
+			mlog.Err(err),
+			mlog.String("node_id", rc.nodeID))
+		return
+	}
+
+	// If not successful, verify who is the leader
+	if !success {
+		// Check who is the current leader
+		leaderID, err := rc.rdb.Get(ctx, redisLeaderKey).Result()
+		if err != nil {
+			if err != redis.Nil {
+				rc.logger.Error("Failed to get current leader",
+					mlog.Err(err),
+					mlog.String("node_id", rc.nodeID))
+			}
+			// Consider it's not the leader
+			rc.isLeader.Store(false)
+		} else {
+			// Still the leader if the ID matches
+			rc.isLeader.Store(leaderID == rc.nodeID)
+		}
+	} else {
+		// Successfully became the leader
+		rc.isLeader.Store(true)
+	}
+
+	isLeader := rc.isLeader.Load()
+
+	// Set sync version for this node
+	_, err = rc.rdb.Set(ctx, fmt.Sprintf("%s:sync:%s", redisNodesKey, rc.nodeID), rc.syncVersion.Load(), nodesTTL).Result()
+	if err != nil {
+		rc.logger.Error("Failed to set sync version",
+			mlog.Err(err),
+			mlog.String("node_id", rc.nodeID))
+	}
+
+	// Check if leader status changed
+	if wasLeader != isLeader {
+		if isLeader {
+			rc.logger.Info("Became cluster leader", mlog.String("node_id", rc.nodeID))
+			// Trigger immediate sync when becoming leader
+			go rc.verifyClusterSync()
+		} else {
+			rc.logger.Info("Lost cluster leadership", mlog.String("node_id", rc.nodeID))
+		}
+		// Notify platform service
+		rc.ps.InvokeClusterLeaderChangedListeners()
+	}
+
+	// If leader, refresh TTL to maintain leadership
+	if isLeader {
+		_, err := rc.rdb.Expire(ctx, redisLeaderKey, leaderTTL).Result()
+		if err != nil {
+			rc.logger.Error("Failed to refresh leader TTL",
+				mlog.Err(err),
+				mlog.String("node_id", rc.nodeID))
+		}
+	}
+}
+
+// heartbeatLoop periodically sends node heartbeats
+func (rc *RedisCluster) heartbeatLoop() {
+	defer rc.wg.Done()
+	ticker := time.NewTicker(heartbeatInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-rc.ctx.Done():
+			return
+		case <-ticker.C:
+			rc.sendHeartbeat()
+		}
+	}
+}
+
+// sendHeartbeat updates node information in Redis
+func (rc *RedisCluster) sendHeartbeat() {
+	ctx, cancel := context.WithTimeout(rc.ctx, 2*time.Second)
+	defer cancel()
+
+	nodeInfo := &model.ClusterInfo{
+		Id:      rc.nodeID,
+		Version: model.CurrentVersion,
+	}
+
+	data, err := json.Marshal(nodeInfo)
+	if err != nil {
+		rc.logger.Error("Failed to marshal node info",
+			mlog.Err(err),
+			mlog.String("node_id", rc.nodeID))
+		return
+	}
+
+	// Use pipeline for multiple operations
+	pipe := rc.rdb.Pipeline()
+
+	// Set node info with TTL
+	nodeKey := fmt.Sprintf("%s:%s", redisNodesKey, rc.nodeID)
+	pipe.Set(ctx, nodeKey, string(data), nodesTTL)
+
+	// Set sync version with TTL
+	syncKey := fmt.Sprintf("%s:sync:%s", redisNodesKey, rc.nodeID)
+	pipe.Set(ctx, syncKey, rc.syncVersion.Load(), nodesTTL)
+
+	_, err = pipe.Exec(ctx)
+	if err != nil {
+		rc.logger.Error("Failed to send heartbeat",
+			mlog.Err(err),
+			mlog.String("node_id", rc.nodeID))
+	}
+}
+
+// ======================================================
+// Message Processing
+// ======================================================
+
+// messageListener listens for messages from Redis pubsub
+func (rc *RedisCluster) messageListener() {
+	defer rc.wg.Done()
+	ch := rc.pubsub.Channel()
+
+	for {
+		select {
+		case <-rc.ctx.Done():
+			return
+		case msg := <-ch:
+			if msg == nil {
+				continue
+			}
+
+			switch msg.Channel {
+			case redisPubSubChannel:
+				rc.handleClusterMessage(msg.Payload)
+			case redisEventChannel:
+				rc.handleEventMessage(msg.Payload)
+			}
+		}
+	}
+}
+
+// handleClusterMessage processes messages from the cluster channel
+func (rc *RedisCluster) handleClusterMessage(payload string) {
+	var msg model.ClusterMessage
+	if err := json.Unmarshal([]byte(payload), &msg); err != nil {
+		rc.logger.Error("Failed to unmarshal cluster message",
+			mlog.Err(err),
+			mlog.String("node_id", rc.nodeID))
+		return
+	}
+
+	// Ensure Props is initialized
+	if msg.Props == nil {
+		msg.Props = make(map[string]string)
+	}
+
+	rc.logger.Debug("Received cluster message",
+		mlog.String("event", string(msg.Event)),
+		mlog.String("node_id", rc.nodeID),
+		mlog.Bool("has_handler", rc.hasHandler(msg.Event)))
+
+	// Add to message buffer
+	select {
+	case rc.messageBuffer <- msg:
+		// Message buffered successfully
+	default:
+		rc.logger.Warn("Message buffer full, dropping message",
+			mlog.String("event", string(msg.Event)),
+			mlog.String("node_id", rc.nodeID))
+	}
+}
+
+// handleEventMessage processes messages from the event channel
+func (rc *RedisCluster) handleEventMessage(payload string) {
+	var ev model.PluginClusterEvent
+	if err := json.Unmarshal([]byte(payload), &ev); err != nil {
+		rc.logger.Error("Failed to unmarshal plugin event", mlog.Err(err))
+		return
+	}
+
+	rc.handlersMutex.RLock()
+	handlers, ok := rc.handlers[model.ClusterEventPluginEvent]
+	rc.handlersMutex.RUnlock()
+
+	if !ok {
+		return
+	}
+
+	msg := &model.ClusterMessage{
+		Event: model.ClusterEventPluginEvent,
+		Props: map[string]string{
+			"EventId":        ev.Id,
+			"source_node_id": rc.nodeID,
+			"msg_id":         model.NewId(),
+		},
+		Data: ev.Data,
+	}
+
+	for _, handler := range handlers {
+		handler(msg)
+	}
+}
+
+// messageProcessor processes buffered messages
+func (rc *RedisCluster) messageProcessor() {
+	defer rc.wg.Done()
+
+	for {
+		select {
+		case <-rc.ctx.Done():
+			return
+		case msg := <-rc.messageBuffer:
+			if !rc.isReady.Load() {
+				rc.logger.Debug("Node not ready, skipping message",
+					mlog.String("event", string(msg.Event)),
+					mlog.String("node_id", rc.nodeID))
+				continue
+			}
+			rc.processMessage(&msg)
+		}
+	}
+}
+
+// processMessage handles a single cluster message
+func (rc *RedisCluster) processMessage(msg *model.ClusterMessage) {
+	// Skip if this message came from this node
+	if msg.Props != nil && msg.Props["source_node_id"] == rc.nodeID {
+		return
+	}
+
+	// Check for duplicates
+	msgID := msg.Props["msg_id"]
+	if msgID != "" {
+		if _, exists := rc.processedMsgs.LoadOrStore(msgID, true); exists {
+			return
+		}
+		// Cleanup after processing to avoid memory leak
+		defer func() {
+			time.AfterFunc(5*time.Minute, func() {
+				rc.processedMsgs.Delete(msgID)
+			})
+		}()
+	}
+
+	rc.logger.Debug("Processing message",
+		mlog.String("event", string(msg.Event)),
+		mlog.String("node_id", rc.nodeID),
+		mlog.String("msg_id", msgID))
+
+	// Handle WebSocket events
+	if msg.Event == model.ClusterEventPublish {
+		rc.processWebSocketEvent(msg)
+		return
+	}
+
+	// Get handlers for this event
+	rc.handlersMutex.RLock()
+	handlers, ok := rc.handlers[msg.Event]
+	rc.handlersMutex.RUnlock()
+
+	if !ok {
+		return
+	}
+
+	// Call all registered handlers
+	for _, handler := range handlers {
+		handler(msg)
+	}
+}
+
+// processWebSocketEvent handles WebSocket publish events
+func (rc *RedisCluster) processWebSocketEvent(msg *model.ClusterMessage) {
+	wsMsg, err := model.WebSocketEventFromJSON(bytes.NewReader(msg.Data))
+	if err != nil {
+		rc.logger.Error("Failed to deserialize WebSocket event",
+			mlog.Err(err),
+			mlog.String("node_id", rc.nodeID))
+		return
+	}
+	// Set from cluster to avoid re-sending
+	wsMsg.SetFromCluster(true)
+	rc.ps.PublishSkipClusterSend(wsMsg)
+}
+
+// ======================================================
+// Reliable Message Delivery
+// ======================================================
+
+// processReliableMessages processes messages that were sent reliably
+func (rc *RedisCluster) processReliableMessages() {
+	defer rc.wg.Done()
+	ticker := time.NewTicker(reliableProcessDelay)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-rc.ctx.Done():
+			return
+		case <-ticker.C:
+			if !rc.isReady.Load() {
+				continue
+			}
+
+			rc.processReliableMessageBatch()
+		}
+	}
+}
+
+// processReliableMessageBatch processes a batch of reliable messages
+func (rc *RedisCluster) processReliableMessageBatch() {
+	ctx, cancel := context.WithTimeout(rc.ctx, 5*time.Second)
+	defer cancel()
+
+	// Get the list of reliable messages
+	listKey := fmt.Sprintf("%s:list", redisReliablePrefix)
+
+	// Get up to 100 messages at a time
+	keys, err := rc.rdb.LRange(ctx, listKey, 0, 99).Result()
+	if err != nil {
+		rc.logger.Error("Failed to get reliable message list",
+			mlog.Err(err),
+			mlog.String("node_id", rc.nodeID))
+		return
+	}
+
+	// Process each message
+	for _, key := range keys {
+		rc.processReliableMessageKey(ctx, key, listKey)
+	}
+}
+
+// processReliableMessageKey processes a single reliable message
+func (rc *RedisCluster) processReliableMessageKey(ctx context.Context, key, listKey string) {
+	// Get the message
+	data, err := rc.rdb.Get(ctx, key).Result()
+	if err != nil {
+		if err != redis.Nil {
+			rc.logger.Error("Failed to get reliable message",
+				mlog.Err(err),
+				mlog.String("key", key))
+		}
+
+		// Remove from list regardless since it doesn't exist
+		rc.rdb.LRem(ctx, listKey, 1, key)
+		return
+	}
+
+	// Parse the message
+	var msg model.ClusterMessage
+	if err := json.Unmarshal([]byte(data), &msg); err != nil {
+		rc.logger.Error("Failed to unmarshal reliable message",
+			mlog.Err(err),
+			mlog.String("key", key))
+
+		// Remove invalid message
+		rc.rdb.LRem(ctx, listKey, 1, key)
+		return
+	}
+
+	// Process the message
+	rc.logger.Debug("Processing reliable message",
+		mlog.String("event", string(msg.Event)),
+		mlog.String("msg_id", msg.Props["msg_id"]))
+
+	// Add to message buffer
+	select {
+	case rc.messageBuffer <- msg:
+		// Successfully buffered
+		// Remove from list after processing
+		rc.rdb.LRem(ctx, listKey, 1, key)
+	default:
+		rc.logger.Warn("Message buffer full, will retry reliable message later",
+			mlog.String("event", string(msg.Event)))
+		// Continue without removing from the list
+	}
+}
+
+// processRetryQueue processes messages that failed to be sent
+func (rc *RedisCluster) processRetryQueue() {
+	defer rc.wg.Done()
+	ticker := time.NewTicker(reliableRetryInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-rc.ctx.Done():
+			return
+		case <-ticker.C:
+			// Process retry queue if ready
+			if !rc.isReady.Load() {
+				continue
+			}
+
+			rc.processRetryBatch()
+		}
+	}
+}
+
+// processRetryBatch processes a batch of retry messages
+func (rc *RedisCluster) processRetryBatch() {
+retryLoop:
+	for {
+		select {
+		case msg := <-rc.retryQueue:
+			rc.retryMessage(msg)
+		default:
+			// No more messages in queue
+			break retryLoop
+		}
+	}
+}
+
+// retryMessage attempts to resend a failed message
+func (rc *RedisCluster) retryMessage(msg *model.ClusterMessage) {
+	rc.logger.Debug("Retrying message from queue",
+		mlog.String("event", string(msg.Event)),
+		mlog.String("msg_id", msg.Props["msg_id"]))
+
+	data, err := json.Marshal(msg)
+	if err != nil {
+		rc.logger.Error("Failed to marshal retry message",
+			mlog.Err(err),
+			mlog.String("event", string(msg.Event)))
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(rc.ctx, 2*time.Second)
+	defer cancel()
+
+	// Determine channel based on event type
+	channel := redisPubSubChannel
+	if msg.Event == model.ClusterEventPluginEvent {
+		channel = redisEventChannel
+	}
+
+	// Publish the message
+	err = rc.rdb.Publish(ctx, channel, string(data)).Err()
+	if err != nil {
+		rc.logger.Error("Failed to publish retry message",
+			mlog.Err(err),
+			mlog.String("event", string(msg.Event)))
+
+		// Put back in queue if it's still reliable
+		if msg.SendType == model.ClusterSendReliable {
+			select {
+			case rc.retryQueue <- msg:
+				// Successfully re-queued
+			default:
+				rc.logger.Error("Retry queue full, dropping message",
+					mlog.String("event", string(msg.Event)))
+			}
+		}
+	}
+}
+
+// ======================================================
+// Cluster Synchronization
+// ======================================================
+
+// syncLoop periodically verifies cluster synchronization
+func (rc *RedisCluster) syncLoop() {
+	defer rc.wg.Done()
+	ticker := time.NewTicker(heartbeatInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-rc.ctx.Done():
+			return
+		case <-ticker.C:
+			rc.verifyClusterSync()
+		}
+	}
+}
+
+// verifyClusterSync checks the consistency of the cluster
+func (rc *RedisCluster) verifyClusterSync() {
+	// Get all cluster nodes
+	nodes := rc.GetClusterInfos()
+	if len(nodes) == 0 {
+		rc.logger.Warn("No cluster nodes found during sync verification",
+			mlog.String("node_id", rc.nodeID))
+		return
+	}
+
+	// Check version consistency
+	for _, node := range nodes {
+		if node.Version != model.CurrentVersion {
+			rc.logger.Error("Version mismatch detected",
+				mlog.String("node_id", rc.nodeID),
+				mlog.String("remote_node_id", node.Id),
+				mlog.String("local_version", model.CurrentVersion),
+				mlog.String("remote_version", node.Version))
+		}
+	}
+
+	// Update sync timestamp
+	rc.lastSync.Store(time.Now().UnixNano())
+}
+
+// ======================================================
+// Message Sending
+// ======================================================
+
+// SendClusterMessage sends a message to all nodes in the cluster
+func (rc *RedisCluster) SendClusterMessage(msg *model.ClusterMessage) {
+	// Initialize props if needed
+	if msg.Props == nil {
+		msg.Props = make(map[string]string)
+	}
+
+	// Add source node ID and message ID for tracking
+	msg.Props["source_node_id"] = rc.nodeID
+	msg.Props["msg_id"] = model.NewId()
+
+	data, err := json.Marshal(msg)
+	if err != nil {
+		rc.logger.Error("Failed to marshal cluster message",
+			mlog.Err(err),
+			mlog.String("node_id", rc.nodeID))
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(rc.ctx, 2*time.Second)
+	defer cancel()
+
+	// Use specific channel for plugin events
+	channel := redisPubSubChannel
+	if msg.Event == model.ClusterEventPluginEvent {
+		channel = redisEventChannel
+	}
+
+	// Handle reliable message delivery
+	if rc.reliableEnabled && msg.SendType == model.ClusterSendReliable {
+		rc.storeReliableMessage(ctx, msg, string(data))
+	}
+
+	// Use pipeline for multiple operations
+	pipe := rc.rdb.Pipeline()
+
+	// Publish message
+	pipe.Publish(ctx, channel, string(data))
+
+	// Update sync version
+	syncVer := rc.syncVersion.Add(1)
+	pipe.Set(ctx, fmt.Sprintf("%s:sync:%s", redisNodesKey, rc.nodeID), syncVer, nodesTTL)
+
+	_, err = pipe.Exec(ctx)
+	if err != nil {
+		rc.logger.Error("Failed to publish cluster message",
+			mlog.Err(err),
+			mlog.String("event", string(msg.Event)),
+			mlog.String("node_id", rc.nodeID))
+
+		// Add to retry queue
+		if msg.SendType == model.ClusterSendReliable {
+			select {
+			case rc.retryQueue <- msg:
+				rc.logger.Debug("Added message to retry queue",
+					mlog.String("event", string(msg.Event)),
+					mlog.String("msg_id", msg.Props["msg_id"]))
+			default:
+				rc.logger.Error("Retry queue full, dropping message",
+					mlog.String("event", string(msg.Event)))
+			}
+		}
+	}
+}
+
+// storeReliableMessage stores a message for reliable delivery
+func (rc *RedisCluster) storeReliableMessage(ctx context.Context, msg *model.ClusterMessage, data string) {
+	key := fmt.Sprintf("%s:%s:%s", redisReliablePrefix, string(msg.Event), msg.Props["msg_id"])
+
+	// Store message in Redis for reliable delivery
+	if err := rc.rdb.Set(ctx, key, data, reliableMessageTTL).Err(); err != nil {
+		rc.logger.Error("Failed to store reliable message",
+			mlog.Err(err),
+			mlog.String("node_id", rc.nodeID),
+			mlog.String("msg_id", msg.Props["msg_id"]))
+		return
+	}
+
+	// Add to list of reliable messages to process
+	listKey := fmt.Sprintf("%s:list", redisReliablePrefix)
+	if err := rc.rdb.RPush(ctx, listKey, key).Err(); err != nil {
+		rc.logger.Error("Failed to add to reliable message list",
+			mlog.Err(err),
+			mlog.String("node_id", rc.nodeID))
+		return
+	}
+
+	// Ensure list has TTL
+	rc.rdb.Expire(ctx, listKey, reliableMessageTTL)
+}
+
+// ======================================================
+// ClusterInterface Implementation
+// ======================================================
+
+// StartInterNodeCommunication starts the cluster communication
+func (rc *RedisCluster) StartInterNodeCommunication() {
+	if err := rc.Start(); err != nil {
+		rc.logger.Error("Failed to start cluster communication", mlog.Err(err))
+	}
+}
+
+// StopInterNodeCommunication stops the cluster communication
+func (rc *RedisCluster) StopInterNodeCommunication() {
+	rc.Stop()
+}
+
+// RegisterClusterMessageHandler registers a handler for cluster events
+func (rc *RedisCluster) RegisterClusterMessageHandler(event model.ClusterEvent, handler einterfaces.ClusterMessageHandler) {
+	rc.handlersMutex.Lock()
+	defer rc.handlersMutex.Unlock()
+	rc.handlers[event] = append(rc.handlers[event], handler)
+}
+
+// GetClusterId returns the ID of this node
+func (rc *RedisCluster) GetClusterId() string {
+	return rc.nodeID
+}
+
+// IsLeader returns whether this node is the cluster leader
+func (rc *RedisCluster) IsLeader() bool {
+	return rc.isLeader.Load()
+}
+
+// GetMyClusterInfo returns info about this node
+func (rc *RedisCluster) GetMyClusterInfo() *model.ClusterInfo {
+	return &model.ClusterInfo{
+		Id:      rc.nodeID,
+		Version: model.CurrentVersion,
+	}
+}
+
+// GetClusterInfos returns info about all nodes in the cluster
+func (rc *RedisCluster) GetClusterInfos() []*model.ClusterInfo {
+	ctx, cancel := context.WithTimeout(rc.ctx, 5*time.Second)
+	defer cancel()
+
+	pattern := fmt.Sprintf("%s:*", redisNodesKey)
+	keys, err := rc.rdb.Keys(ctx, pattern).Result()
+	if err != nil {
+		rc.logger.Error("Failed to get cluster nodes", mlog.Err(err))
+		return nil
+	}
+
+	var infos []*model.ClusterInfo
+	for _, key := range keys {
+		// Skip sync keys
+		if bytes.Contains([]byte(key), []byte(":sync:")) {
+			continue
+		}
+
+		data, err := rc.rdb.Get(ctx, key).Result()
+		if err != nil {
+			rc.logger.Debug("Failed to get node info",
+				mlog.String("key", key),
+				mlog.Err(err))
+			continue
+		}
+
+		var info model.ClusterInfo
+		if err := json.Unmarshal([]byte(data), &info); err != nil {
+			rc.logger.Debug("Failed to unmarshal node info",
+				mlog.String("key", key),
+				mlog.Err(err))
+			continue
+		}
+		infos = append(infos, &info)
+	}
+
+	rc.logger.Debug("Got cluster information",
+		mlog.Int("node_count", len(infos)),
+		mlog.String("node_id", rc.nodeID))
+
+	return infos
+}
+
+// SendClusterMessageToNode sends a message to a specific node
+func (rc *RedisCluster) SendClusterMessageToNode(nodeID string, msg *model.ClusterMessage) error {
+	// In Redis implementation, all messages are broadcasted
+	rc.SendClusterMessage(msg)
+	return nil
+}
+
+// GetClusterStats returns stats about all nodes
+func (rc *RedisCluster) GetClusterStats(ctx request.CTX) ([]*model.ClusterStats, *model.AppError) {
+	nodes := rc.GetClusterInfos()
+	stats := make([]*model.ClusterStats, 0, len(nodes))
+
+	for _, node := range nodes {
+		stat := &model.ClusterStats{
+			Id: node.Id,
+		}
+		stats = append(stats, stat)
+	}
+
+	return stats, nil
+}
+
+// hasHandler checks if a handler exists for the event
+func (rc *RedisCluster) hasHandler(event model.ClusterEvent) bool {
+	rc.handlersMutex.RLock()
+	defer rc.handlersMutex.RUnlock()
+	_, ok := rc.handlers[event]
+	return ok
+}
+
+// GetLogs returns cluster logs (not implemented for Redis)
+func (rc *RedisCluster) GetLogs(ctx request.CTX, page, perPage int) ([]string, *model.AppError) {
+	// Not implemented for Redis cluster
+	return []string{}, nil
+}
+
+// GetPluginStatuses returns plugin statuses (not implemented for Redis)
+func (rc *RedisCluster) GetPluginStatuses() (model.PluginStatuses, *model.AppError) {
+	// Not implemented for Redis cluster
+	return model.PluginStatuses{}, nil
+}
+
+// ConfigChanged handles config changes
+func (rc *RedisCluster) ConfigChanged(old, new *model.Config, sendToOtherServer bool) *model.AppError {
+	// Nothing to do for config changes
+	return nil
+}
+
+// GenerateSupportPacket generates a support packet with cluster info
+func (rc *RedisCluster) GenerateSupportPacket(ctx request.CTX, opts *model.SupportPacketOptions) (map[string][]model.FileData, error) {
+	result := make(map[string][]model.FileData)
+
+	// Add cluster information
+	clusterInfo := &model.ClusterInfo{
+		Id:      rc.nodeID,
+		Version: model.CurrentVersion,
+	}
+
+	infoBytes, err := json.Marshal(clusterInfo)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal cluster info: %w", err)
+	}
+
+	result["cluster_info"] = []model.FileData{{
+		Filename: "cluster_info.json",
+		Body:     infoBytes,
+	}}
+
+	// Add node status
+	nodes := rc.GetClusterInfos()
+	nodesBytes, err := json.Marshal(nodes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal nodes info: %w", err)
+	}
+
+	result["cluster_nodes"] = []model.FileData{{
+		Filename: "cluster_nodes.json",
+		Body:     nodesBytes,
+	}}
+
+	return result, nil
+}
+
+// GetWSQueues returns WebSocket queues (not implemented for Redis)
+func (rc *RedisCluster) GetWSQueues(userID, connectionID string, seqNum int64) (map[string]*model.WSQueues, error) {
+	// For Redis implementation, we don't track WebSocket queues per node
+	return map[string]*model.WSQueues{}, nil
+}
+
+// QueryLogs queries logs (not implemented for Redis)
+func (rc *RedisCluster) QueryLogs(rctx request.CTX, page, perPage int) (map[string][]string, *model.AppError) {
+	// Not implemented for Redis cluster
+	return map[string][]string{}, nil
+}
+
+// WebConnCountForUser returns connection count (not implemented for Redis)
+func (rc *RedisCluster) WebConnCountForUser(userID string) (int, *model.AppError) {
+	// For Redis implementation, we don't track connection counts per node
+	return 0, nil
+}
+
+// NotifyMsg is not used in Redis implementation
+func (rc *RedisCluster) NotifyMsg(buf []byte) {
+	// Unused in Redis implementation
+}
+
+// HealthScore returns the health score of the cluster
+func (rc *RedisCluster) HealthScore() int {
+	ctx, cancel := context.WithTimeout(rc.ctx, 2*time.Second)
+	defer cancel()
+
+	// Check Redis connection
+	if err := rc.rdb.Ping(ctx).Err(); err != nil {
+		return 100 // Unhealthy
+	}
+
+	// Check if we can publish/subscribe
+	if rc.pubsub == nil {
+		return 100 // Unhealthy
+	}
+
+	return 0 // Healthy
+}
+
+// SetReady marks the node as ready
+func (rc *RedisCluster) SetReady() {
+	rc.isReady.Store(true)
+	rc.logger.Info("Redis cluster node is ready", mlog.String("node_id", rc.nodeID))
+}
+
+// ======================================================
+// WebSocket Event Broadcasting
+// ======================================================
+
+// BroadcastWebSocketEvent broadcasts WebSocket events to all nodes
+func (rc *RedisCluster) BroadcastWebSocketEvent(event *model.WebSocketEvent) {
+	// Skip if the event is already from another cluster node
+	if event.IsFromCluster() {
+		return
+	}
+
+	// Apply broadcast hooks if defined
+	if len(event.GetBroadcast().BroadcastHooks) > 0 {
+		event = rc.applyBroadcastHooks(event)
+	}
+
+	// Mark the event as coming from cluster
+	event = event.SetFromCluster(true)
+
+	// Convert WebSocketEvent to JSON bytes
+	data, err := event.ToJSON()
+	if err != nil {
+		rc.logger.Error("Failed to marshal WebSocket event", mlog.Err(err))
+		return
+	}
+
+	// Create cluster message with appropriate send type
+	msg := &model.ClusterMessage{
+		Event:    model.ClusterEventPublish,
+		Data:     data,
+		SendType: model.ClusterSendBestEffort,
+	}
+
+	// Determine if this should be sent reliably
+	if needsReliableDelivery(event) || 
+	   (event.GetBroadcast() != nil && event.GetBroadcast().ReliableClusterSend) {
+		msg.SendType = model.ClusterSendReliable
+	}
+
+	// Send to other nodes via Redis
+	rc.SendClusterMessage(msg)
+}
+
+// applyBroadcastHooks applies hooks to a WebSocket event
+func (rc *RedisCluster) applyBroadcastHooks(event *model.WebSocketEvent) *model.WebSocketEvent {
+	ev, hooks, hookArgs := event.WithoutBroadcastHooks()
+
+	for i, hookID := range hooks {
+		if hook, ok := rc.broadcastHooks[hookID]; ok {
+			var args map[string]any
+			if i < len(hookArgs) {
+				args = hookArgs[i]
+			}
+
+			// Create a HookedWebSocketEvent to pass to the hook
+			hookedEvent := MakeHookedWebSocketEvent(ev)
+
+			// Call the Process method
+			if err := hook.Process(hookedEvent, nil, args); err != nil {
+				rc.logger.Error("Failed to process broadcast hook",
+					mlog.String("hook_id", hookID),
+					mlog.Err(err))
+				continue
+			}
+
+			// Get the processed event
+			ev = hookedEvent.Event()
+		}
+	}
+
+	return ev
+}
+
+// needsReliableDelivery determines if an event should be sent reliably
+func needsReliableDelivery(event *model.WebSocketEvent) bool {
+	switch event.EventType() {
+	case model.WebsocketEventPosted,
+		model.WebsocketEventPostEdited,
+		model.WebsocketEventPostDeleted,
+		model.WebsocketEventDirectAdded,
+		model.WebsocketEventGroupAdded,
+		model.WebsocketEventAddedToTeam,
+		model.WebsocketEventLeaveTeam,
+		model.WebsocketEventUpdateTeam,
+		model.WebsocketEventUserAdded,
+		model.WebsocketEventUserUpdated,
+		model.WebsocketEventStatusChange,
+		model.WebsocketEventHello,
+		model.WebsocketEventChannelUpdated,
+		model.WebsocketEventChannelCreated,
+		model.WebsocketEventChannelDeleted:
+		return true
+	}
+	return false
+}
+
+// Publish sends a WebSocket event to all nodes
+func (rc *RedisCluster) Publish(event *model.WebSocketEvent) {
+	// Skip if the event is already from another cluster node
+	if event.IsFromCluster() {
+		return
+	}
+
+	// Mark the event as coming from cluster
+	event = event.SetFromCluster(true)
+
+	// Set the node ID in the broadcast if it exists
+	if event.GetBroadcast() != nil {
+		event = event.SetBroadcast(event.GetBroadcast())
+		event.GetBroadcast().ConnectionId = rc.nodeID
+	}
+
+	// Local broadcast first for this node
+	rc.ps.PublishSkipClusterSend(event)
+
+	// Prepare cluster message for other nodes
+	data, err := event.ToJSON()
+	if err != nil {
+		rc.logger.Error("Failed to marshal WebSocket event", mlog.Err(err))
+		return
+	}
+
+	// Create a cluster message to send to other nodes
+	msg := &model.ClusterMessage{
+		Event:    model.ClusterEventPublish,
+		Data:     data,
+		SendType: model.ClusterSendBestEffort,
+	}
+
+	// Check if this needs reliable delivery
+	if event.EventType() == model.WebsocketEventPosted ||
+		event.EventType() == model.WebsocketEventPostEdited ||
+		(event.GetBroadcast() != nil && event.GetBroadcast().ReliableClusterSend) {
+		msg.SendType = model.ClusterSendReliable
+	}
+
+	// Send to all other nodes
+	rc.SendClusterMessage(msg)
+}
